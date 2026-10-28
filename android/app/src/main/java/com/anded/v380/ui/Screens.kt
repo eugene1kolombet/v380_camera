@@ -1,12 +1,15 @@
 package com.anded.v380.ui
 
 import android.content.Intent
+import android.view.SurfaceHolder
+import android.view.SurfaceView
 import android.view.ViewGroup
 import androidx.annotation.OptIn
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -64,6 +67,7 @@ import androidx.media3.ui.PlayerView
 import com.anded.v380.I18n
 import com.anded.v380.Lang
 import com.anded.v380.proto.RtspFixProxy
+import com.anded.v380.proto.StreamPlayer
 import com.anded.v380.proto.V380Session.Segment
 import java.io.File
 import java.text.SimpleDateFormat
@@ -228,7 +232,7 @@ fun RecordingsScreen(vm: CameraViewModel) {
             title = { Text(timeFmt.format(Date(seg.startMs)) + " · " + durText(seg.durationMs)) },
             text = {
                 Column {
-                    TextButton({ menuFor = null; vm.download(seg, true) }) { Text(I18n.s.watch) }
+                    TextButton({ menuFor = null; vm.watch(seg) }) { Text(I18n.s.watch) }
                     if (!have) TextButton({ menuFor = null; vm.download(seg, false) }) { Text(I18n.s.download) }
                     if (have) {
                         TextButton({ menuFor = null; vm.saveToGallery(f) }) { Text(I18n.s.saveToGallery) }
@@ -303,6 +307,42 @@ fun PlayerScreen(vm: CameraViewModel, file: File) {
         Row(Modifier.align(Alignment.TopStart).padding(8.dp), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             FilledTonalButton({ vm.playing = null }) { Text(I18n.s.back) }
             FilledTonalButton({ vm.saveToGallery(file) }) { Text(I18n.s.toGallery) }
+        }
+    }
+}
+
+// ===================== Просмотр во время загрузки =====================
+
+@Composable
+fun StreamScreen(vm: CameraViewModel, sp: StreamPlayer) {
+    Box(Modifier.fillMaxSize().background(Color.Black).safeDrawingPadding()) {
+        AndroidView(
+            factory = { ctx ->
+                SurfaceView(ctx).apply {
+                    keepScreenOn = true
+                    holder.addCallback(object : SurfaceHolder.Callback {
+                        override fun surfaceCreated(h: SurfaceHolder) = sp.setSurface(h.surface)
+                        override fun surfaceChanged(h: SurfaceHolder, format: Int, w: Int, hh: Int) {}
+                        // Экран закрыт или приложение ушло в фон — просмотр заканчивается.
+                        override fun surfaceDestroyed(h: SurfaceHolder) {
+                            sp.setSurface(null)
+                            vm.stopStream()
+                        }
+                    })
+                }
+            },
+            modifier = Modifier.align(Alignment.Center).aspectRatio(vm.streamAspect),
+        )
+        vm.streamText?.let { Text(it, Modifier.align(Alignment.Center).padding(16.dp), color = Color.White) }
+        Row(
+            Modifier.align(Alignment.TopStart).padding(8.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            FilledTonalButton({ vm.stopStream() }) { Text(I18n.s.back) }
+            vm.streamDownload?.let {
+                Text(it.text, color = Color.White.copy(alpha = 0.7f), style = MaterialTheme.typography.labelMedium)
+            }
         }
     }
 }

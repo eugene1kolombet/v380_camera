@@ -96,6 +96,8 @@ class Strings(private val ru: Boolean) {
 
     // ---------- плеер и живое видео ----------
     val back get() = t("Back", "Назад")
+    val loadingRecording get() = t("Loading recording…", "Загрузка записи…")
+    val streamEnded get() = t("End of recording", "Конец записи")
     val toGallery get() = t("To gallery", "В галерею")
     val connecting get() = t("Connecting…", "Подключение…")
     val buffering get() = t("Buffering…", "Буферизация…")

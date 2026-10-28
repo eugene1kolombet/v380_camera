@@ -49,6 +49,12 @@ class MainActivity : ComponentActivity() {
 @Composable
 private fun App(vm: CameraViewModel) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
+    val sp = vm.stream
+    if (sp != null) {
+        BackHandler { vm.stopStream() }
+        StreamScreen(vm, sp)
+        return
+    }
     val file = vm.playing
     if (file != null) {
         BackHandler { vm.playing = null }

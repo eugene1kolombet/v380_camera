@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Environment
 import android.provider.MediaStore
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -16,6 +17,7 @@ import com.anded.v380.I18n
 import com.anded.v380.proto.CameraException
 import com.anded.v380.proto.Discovery
 import com.anded.v380.proto.Replay
+import com.anded.v380.proto.StreamPlayer
 import com.anded.v380.proto.V380Session
 import com.anded.v380.proto.V380Session.Segment
 import kotlinx.coroutines.CancellationException
@@ -61,6 +63,17 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
     val downloads = mutableStateMapOf<Long, DownloadState>()
     var playing by mutableStateOf<File?>(null)
     var message by mutableStateOf<String?>(null)
+
+    /** Просмотр записи во время загрузки; null — не идёт. */
+    var stream by mutableStateOf<StreamPlayer?>(null)
+        private set
+    private var streamSeg: Segment? = null
+    /** Надпись поверх видео: загрузка, конец записи, ошибка; null — видео идёт. */
+    var streamText by mutableStateOf<String?>(null)
+        private set
+    var streamAspect by mutableFloatStateOf(16f / 9f)
+        private set
+    val streamDownload: DownloadState? get() = streamSeg?.let { downloads[it.startMs] }
 
     private val downloadJobs = HashMap<Long, Job>()
 
@@ -151,8 +164,34 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
 
     fun isDownloaded(seg: Segment) = fileFor(seg).let { it.exists() && it.length() > 0 }
 
-    /** Скачать запись; [play] — открыть плеер по готовности. */
-    fun download(seg: Segment, play: Boolean) {
+    /** «Смотреть»: скачанная запись открывается из файла, иначе играет по мере загрузки и сохраняется. */
+    fun watch(seg: Segment) {
+        if (isDownloaded(seg) || downloadJobs[seg.startMs]?.isActive == true) {
+            download(seg, true)
+            return
+        }
+        val sp = StreamPlayer()
+        sp.onPlaying = { viewModelScope.launch { if (stream === sp) streamText = null } }
+        sp.onSize = { w, h -> viewModelScope.launch { if (stream === sp && w > 0 && h > 0) streamAspect = w.toFloat() / h } }
+        sp.onEnded = { err -> viewModelScope.launch { if (stream === sp) streamText = err ?: I18n.s.streamEnded } }
+        stream = sp
+        streamSeg = seg
+        streamText = I18n.s.loadingRecording
+        streamAspect = 16f / 9f
+        download(seg, false, sp)
+    }
+
+    fun stopStream() {
+        val sp = stream ?: return
+        sp.release()
+        stream = null
+        // Запись уже загружена — mp4 пусть досохраняется; иначе загрузка больше не нужна.
+        if (!sp.loaded) streamSeg?.let { cancelDownload(it) }
+        streamSeg = null
+    }
+
+    /** Скачать запись; [play] — открыть плеер по готовности; [sink] — кадры для просмотра во время загрузки. */
+    fun download(seg: Segment, play: Boolean, sink: StreamPlayer? = null) {
         val f = fileFor(seg)
         if (f.exists() && f.length() > 0) {
             if (play) playing = f
@@ -170,7 +209,7 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
             try {
                 withContext(Dispatchers.IO) {
                     val ctx = coroutineContext
-                    Replay.download(camIp, pw, seg, f, { !ctx.isActive }) { p ->
+                    Replay.download(camIp, pw, seg, f, sink, { !ctx.isActive }) { p ->
                         val t = if (p.fraction != null) I18n.s.downloading((p.fraction * 100).toInt()) else I18n.s.frames(p.videoFrames)
                         viewModelScope.launch {
                             downloads[seg.startMs]?.let { downloads[seg.startMs] = it.copy(text = t, fraction = p.fraction) }
@@ -179,13 +218,14 @@ class CameraViewModel(app: Application) : AndroidViewModel(app) {
                 }
                 val st = downloads.remove(seg.startMs)
                 if (st?.playWhenDone == true) playing = f
-                else message = I18n.s.downloaded(f.name)
+                else if (sink == null) message = I18n.s.downloaded(f.name)
             } catch (e: CancellationException) {
                 downloads.remove(seg.startMs)
                 throw e
             } catch (e: Exception) {
                 downloads.remove(seg.startMs)
-                message = I18n.s.downloadFailed((e as? CameraException)?.message ?: e.message)
+                val m = I18n.s.downloadFailed((e as? CameraException)?.message ?: e.message)
+                if (sink != null && stream === sink) streamText = m else message = m
             }
         }
         downloadJobs[seg.startMs] = job

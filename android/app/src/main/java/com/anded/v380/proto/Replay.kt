@@ -17,15 +17,24 @@ object Replay {
     /** Расшифрованный кадр: тип (1 — I, 2 — P, 4 — аудио), данные, время кадра в мс (байты 10..15 заголовка). */
     class Frame(val type: Int, val data: ByteArray, val tsMs: Long)
 
+    /** Получатель кадров во время загрузки (просмотр по мере скачивания). Вызывается из рабочего потока. */
+    interface FrameSink {
+        fun onFormat(sampleRate: Int)
+        fun onFrame(f: Frame)
+        /** Загрузка с камеры закончилась (или прервалась). */
+        fun onEnd()
+    }
+
     /**
      * Скачивает сегмент в [out] (mp4). [onProgress] вызывается из рабочего потока.
-     * [cancelled] проверяется между пакетами.
+     * [cancelled] проверяется между пакетами. [sink] получает каждый кадр сразу после расшифровки.
      */
     fun download(
         ip: String,
         password: String,
         seg: V380Session.Segment,
         out: File,
+        sink: FrameSink?,
         cancelled: () -> Boolean,
         onProgress: (Progress) -> Unit,
     ) {
@@ -37,51 +46,57 @@ object Replay {
         var sampleRate = 16000
         var na = 0
         var audioTs = -1L
-        V380Session.open(ip, password).use { ss ->
-            RandomAccessFile(tmpVideo, "rw").use { vf ->
-                vf.setLength(0)
-                val req = { p: String -> ss.send(V380Session.M_REPLAY, p) }
-                req("{\"pts\":${seg.startMs},\"sts\":${seg.startMs},\"rtype\":${seg.type},\"time_id\":1,\"vsspec\":0,\"frames\":1000,\"video\":1,\"audio\":1}")
-                val limitMs = System.currentTimeMillis() + seg.durationMs + 15000
-                var done = false
-                while (!done && !cancelled() && System.currentTimeMillis() < limitMs) {
-                    val p = try { ss.read() } catch (e: java.net.SocketTimeoutException) { break }
-                    when (p.cmd) {
-                        V380Session.CMD_MEDIA -> {
-                            val f = frameDecrypt(p.body, ss.key) ?: continue
-                            if (f.type == 1 || f.type == 2) {
-                                frames += longArrayOf(vf.filePointer, f.data.size.toLong(), if (f.type == 1) 1 else 0, f.tsMs)
-                                vf.write(f.data)
-                            } else if (f.type == 4) {
-                                if (audioTs < 0) audioTs = f.tsMs
-                                audio.write(f.data); na++
-                            }
-                            if ((frames.size + na) % 20 == 0 && frames.isNotEmpty()) {
-                                val frac = if (seg.durationMs > 0)
-                                    ((frames.last()[3] - seg.startMs).toFloat() / seg.durationMs).coerceIn(0f, 1f) else null
-                                onProgress(Progress(frames.size, na, frac))
-                            }
-                        }
-                        V380Session.CMD_NOTIFY -> {
-                            val par = p.json?.optJSONObject("params") ?: continue
-                            when (par.optInt("info_id")) {
-                                1 -> {
-                                    par.optJSONObject("vattr")?.let {
-                                        width = it.optInt("width", width); height = it.optInt("height", height)
-                                    }
-                                    par.optJSONObject("aattr")?.let { sampleRate = it.optInt("samplerate", sampleRate) }
+        try {
+            V380Session.open(ip, password).use { ss ->
+                RandomAccessFile(tmpVideo, "rw").use { vf ->
+                    vf.setLength(0)
+                    val req = { p: String -> ss.send(V380Session.M_REPLAY, p) }
+                    req("{\"pts\":${seg.startMs},\"sts\":${seg.startMs},\"rtype\":${seg.type},\"time_id\":1,\"vsspec\":0,\"frames\":1000,\"video\":1,\"audio\":1}")
+                    val limitMs = System.currentTimeMillis() + seg.durationMs + 15000
+                    var done = false
+                    while (!done && !cancelled() && System.currentTimeMillis() < limitMs) {
+                        val p = try { ss.read() } catch (e: java.net.SocketTimeoutException) { break }
+                        when (p.cmd) {
+                            V380Session.CMD_MEDIA -> {
+                                val f = frameDecrypt(p.body, ss.key) ?: continue
+                                sink?.onFrame(f)
+                                if (f.type == 1 || f.type == 2) {
+                                    frames += longArrayOf(vf.filePointer, f.data.size.toLong(), if (f.type == 1) 1 else 0, f.tsMs)
+                                    vf.write(f.data)
+                                } else if (f.type == 4) {
+                                    if (audioTs < 0) audioTs = f.tsMs
+                                    audio.write(f.data); na++
                                 }
-                                3 -> done = true
-                                4 -> req("{\"time_id\":1,\"frames\":1000}")
+                                if ((frames.size + na) % 20 == 0 && frames.isNotEmpty()) {
+                                    val frac = if (seg.durationMs > 0)
+                                        ((frames.last()[3] - seg.startMs).toFloat() / seg.durationMs).coerceIn(0f, 1f) else null
+                                    onProgress(Progress(frames.size, na, frac))
+                                }
                             }
-                        }
-                        V380Session.CMD_IOT -> {
-                            val code = p.json?.optJSONObject("result")?.optInt("code", 1000) ?: 1000
-                            if (code != 1000 && frames.isEmpty()) throw CameraException(I18n.s.noRecording(code))
+                            V380Session.CMD_NOTIFY -> {
+                                val par = p.json?.optJSONObject("params") ?: continue
+                                when (par.optInt("info_id")) {
+                                    1 -> {
+                                        par.optJSONObject("vattr")?.let {
+                                            width = it.optInt("width", width); height = it.optInt("height", height)
+                                        }
+                                        par.optJSONObject("aattr")?.let { sampleRate = it.optInt("samplerate", sampleRate) }
+                                        sink?.onFormat(sampleRate)
+                                    }
+                                    3 -> done = true
+                                    4 -> req("{\"time_id\":1,\"frames\":1000}")
+                                }
+                            }
+                            V380Session.CMD_IOT -> {
+                                val code = p.json?.optJSONObject("result")?.optInt("code", 1000) ?: 1000
+                                if (code != 1000 && frames.isEmpty()) throw CameraException(I18n.s.noRecording(code))
+                            }
                         }
                     }
                 }
             }
+        } finally {
+            sink?.onEnd()
         }
         try {
             if (cancelled()) throw CameraException(I18n.s.cancelled)
@@ -162,7 +177,7 @@ object Replay {
     // ---------- H.264 Annex-B ----------
 
     /** NAL-единицы без старт-кодов. */
-    private fun nals(d: ByteArray): List<ByteArray> {
+    fun nals(d: ByteArray): List<ByteArray> {
         val starts = ArrayList<Int>() // индекс первого байта NAL
         var i = 0
         while (i + 3 <= d.size) {
